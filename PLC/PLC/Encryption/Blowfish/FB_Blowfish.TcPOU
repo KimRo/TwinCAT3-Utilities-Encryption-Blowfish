@@ -1,0 +1,670 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.9">
+  <POU Name="FB_Blowfish" Id="{408add15-e33c-44f9-902b-c17a1fa6d9db}" SpecialFunc="None">
+    <Declaration><![CDATA[(* 
+	Encrypting data with the Blowfish algorithm, more info below
+
+	original code 
+	C by Bruce Schneier	https://www.schneier.com/wp-content/uploads/2015/12/bfsh-sch.zip
+
+	TwinCAT code released under MIT license (https://opensource.org/licenses/MIT)
+	Kim Robbens (2022) 
+	
+	<!HARD LIMITATION
+	Due to the limitations of codesys memory allocations,
+	it is only possible to encrypt datablocks that have a byte length MOD 8 == 0	
+	eg STRING[8] is 9 bytes!!
+	See example implementation
+	HARD LIMITATION!>
+*)
+{attribute 'hide_all_locals'}
+FUNCTION_BLOCK FB_Blowfish
+VAR_INPUT
+	SecretKey				: POINTER TO BYTE;	// Make sure that the object is a multiple of 4 bytes!
+	SecretKeyBytes			: INT;
+	bLittleEndian			: BOOL:=TRUE;	(* TRUE: Eg: Intel, FALSE: Eg: Motorola *)
+END_VAR
+VAR_OUTPUT
+	bBusy                   : BOOL; 	(* TRUE => execution in progress, FALSE => execution idle *)
+ 	bError                  : BOOL; 	(* TRUE => Error, FALSE => No error *)
+	bInitialized			: BOOL;		(* TRUE => initialization of the cipher OK *)
+ 	nErrorId                : UDINT;	(* Error code *)
+END_VAR
+VAR
+	// Internal selftest results
+	bSelfTestEncryptionOK	: BOOL;		(* TRUE => internal encryption selftest OK *)
+	bSelfTestDecryptionOK	: BOOL;		(* TRUE => internal decryption selftest OK *)	
+
+	// Local Blowfish state enum
+	eBF_State				: (	E_BF_Idle, 
+								E_BF_FileOpen, E_BF_FileOpening, E_BF_FileIsOpened, 
+								E_BF_P_Array_Read, E_BF_P_Array_IsRead, 
+								E_BF_S_Boxes_Read, E_BF_S_Boxes_IsRead, 
+								E_BF_FileClose, E_BF_FileClosing, E_BF_FileIsClosed,
+								E_BF_SelfTest_Encryption, E_BF_SelfTest_Decryption,
+								E_BF_Ready, E_BF_Error);		
+	// Local error identification
+	eErrorID				: ( E_ERR_NoError,
+								E_ERR_SelfTest_Encryption,
+								E_ERR_DataLength_NOK);
+	// File handling
+	hSubKeyFile				: UINT := 0;(* File handle of the subkey file *)
+	fbFileOpen              : FB_FileOpen;
+	fbFileClose             : FB_FileClose;
+	fbFileRead              : FB_FileRead;
+	// P-Array and S-Boxes
+	_P						: ARRAY[0..N+1] OF UDINT; 		// unsigned long P[N + 2];
+	_S						: ARRAY[0..3,0..255] OF UDINT; 	// unsigned long S[4][256];
+END_VAR
+VAR CONSTANT
+	MAXKEYBYTES 			: BYTE := 56;          // 448 bits 
+	N               		: BYTE := 16;
+	subKeyFilename   		: T_MAXSTRING := 'Blowfish.dat';	
+END_VAR
+(* 
+	Encrypting data with the Blowfish algorithm, info below
+
+	Blowfish is unpatented and license-free, and is available free for all uses.
+
+	Source: https://www.embedded.com/encrypting-data-with-the-blowfish-algorithm/
+
+	Generally speaking, encryption algorithms come in two flavors, symmetric and public key. 
+	Symmetric algorithms, such as Blowfish, use the same key for encryption and decryption. 
+	Like a password, you have to keep the key secret from everyone except the sender and receiver 
+	of the message. 
+
+	Blowfish is a symmetric encryption algorithm, meaning that it uses the same secret key 
+	to both encrypt and decrypt messages. 
+	Blowfish is also a block cipher, meaning that it divides a message up into fixed length blocks 
+	during encryption and decryption. The block length for Blowfish is 64 bits; 
+	messages that aren't a multiple of eight bytes in size must be padded.
+
+	Blowfish is public domain, and was designed by Bruce Schneier expressly for use in 
+	performance-constrained environments such as embedded systems. 
+	It has been extensively analyzed and deemed "reasonably secure" by the cryptographic community. 
+	Implementation examples are available from several sources, including the one by Bruce Schneier 
+	and the one from Paul Kocher that have been used for creating the TwinCAT compatible version. 
+	The original code is available for download at https://www.schneier.com/academic/blowfish/download/
+
+	More info: https://www.schneier.com/academic/blowfish/
+	
+	port of original code 
+	C by Bruce Schneier	https://www.schneier.com/wp-content/uploads/2015/12/bfsh-sch.zip
+*)]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[IF NOT bInitialized		THEN
+	initialize(SecretKey, SecretKeyBytes, TRUE);
+END_IF
+]]></ST>
+    </Implementation>
+    <Method Name="_busy" Id="{d8282567-4b66-406d-8bf8-d51686867eef}">
+      <Declaration><![CDATA[METHOD private _busy
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[bInitialized	:= FALSE;
+bError			:= FALSE;
+nErrorID		:= TO_UDINT(E_ERR_NoError);
+bBusy 			:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="_done" Id="{3cf9ce15-48af-404e-b76c-39e961b17ae4}">
+      <Declaration><![CDATA[METHOD PRIVATE _done
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[bError			:= FALSE;
+bBusy 			:= FALSE;
+nErrorID		:= TO_UDINT(E_ERR_NoError);
+bInitialized	:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="_error" Id="{59cfb401-bd8f-4cde-b9cf-5b06214ddaee}">
+      <Declaration><![CDATA[METHOD PRIVATE _error
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[bBusy 			:= FALSE;
+bError			:= TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="decipher" Id="{6c4cc90a-055e-43e2-9db8-b71a1ba53332}">
+      <Declaration><![CDATA[METHOD PRIVATE decipher
+VAR_INPUT
+	xL					: REFERENCE TO UDINT;
+	xR					: REFERENCE TO UDINT;
+END_VAR
+VAR
+	temp				: UDINT;
+	i					: INT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := N+1 TO 2 BY -1 DO		// for (i = N + 1; i > 1; --i)
+	xL		:= xL XOR _P[i];
+	xR 	:= F(xL) XOR xR;
+	// Exchange xL and xR 
+	temp 	:= xL;
+	xL 	:= xR;
+	xR 	:= temp;
+END_FOR
+
+// Exchange xL and xR
+temp 		:= xL;
+xL 		:= xR;
+xR 		:= temp;
+
+xR 		:= xR XOR _P[1];
+xL 		:= xL XOR _P[0];]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="decrypt" Id="{edbf7a80-132c-4fb8-8aba-5631b5341380}">
+      <Declaration><![CDATA[METHOD PUBLIC decrypt 		: DINT
+VAR_INPUT
+	data					: ANY;	// !!! Only 8 byte multiple sized BYTE arrays !!!
+END_VAR
+VAR
+	dataL					: UDINT;
+	dataR					: UDINT;	
+	i						: DINT;	
+	nMultiples				: DINT;		// Number of blocks of 4 byte
+	bEvenMultiples			: BOOL;		// Number of blocks of 4 byte is even
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF bInitialized 			THEN		// Cipher was initialized
+	// Blowfish is a 4/8 byte block cipher
+	// so first check the length of the data
+	// if the data is no multiple of 4, exit with error
+	decrypt					:= data.diSize MOD 4;
+	IF decrypt = 0 	AND_THEN data.diSize > 0	THEN
+		nMultiples			:= data.diSize / 4;				// Number of blocks
+		bEvenMultiples		:= nMultiples MOD 2 = 0;		// Even number of blocks
+		FOR i := 0 TO nMultiples-1 BY 2 DO
+			dataL				:=
+			dataR				:= 16#0;
+			memcpy(ADR(dataL), ADR(data.pValue[i*4]), 4);
+			IF 	i <	nMultiples-1 OR_ELSE bEvenMultiples THEN
+				memcpy(ADR(dataR), ADR(data.pValue[(i+1)*4]), 4);
+				decipher(dataL, dataR);
+				memcpy(ADR(data.pValue[i*4]), ADR(dataL), 4);				
+				memcpy(ADR(data.pValue[(i+1)*4]), ADR(dataR), 4);
+			ELSE
+				decipher(dataL, dataR);
+				memcpy(ADR(data.pValue[i*4]), ADR(dataL), 4);				
+			END_IF	
+		END_FOR
+	ELSE
+		nErrorId			:= TO_UDINT(E_ERR_DataLength_NOK);
+		_error();		
+	END_IF  
+ELSE
+	initialize(SecretKey, SecretKeyBytes, bLittleEndian);
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="encipher" Id="{905294b8-17f1-43ad-aa0a-10e95fe29b00}">
+      <Declaration><![CDATA[METHOD PRIVATE encipher
+VAR_INPUT
+	xL					: REFERENCE TO UDINT;
+	xR					: REFERENCE TO UDINT;
+END_VAR
+VAR
+	i					: INT;
+	temp				: UDINT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := 0 TO N-1 DO				// for (i = 0; i < N; ++i)
+	xL		:= xL XOR _P[i];
+	xR 		:= F(xL) XOR xR;
+	// Exchange xL and xR
+	temp 	:= xL;
+	xL 		:= xR;
+	xR 		:= temp;
+END_FOR
+
+// Exchange xL and xR 
+temp 		:= xL;
+xL 			:= xR;
+xR 			:= temp;
+
+xR 			:= xR XOR _P[N];		// Xr = Xr ^ _P[N];
+xL 			:= xL XOR _P[N + 1];	// Xl = Xl ^ _P[N + 1];
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="encrypt" Id="{4a156e54-c6d5-4247-89c7-a3f38f8774eb}">
+      <Declaration><![CDATA[METHOD PUBLIC encrypt 		: DINT
+VAR_INPUT
+	data					: ANY;	// !!! Only 8 byte multiple sized BYTE data !!!
+END_VAR
+VAR
+	dataL					: UDINT;
+	dataR					: UDINT;	
+	i						: DINT;	
+	nMultiples				: DINT;		// Number of blocks of 4 byte
+	bEvenMultiples			: BOOL;		// Number of blocks of 4 byte is even
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF bInitialized 			THEN		// Cipher was initialized
+	// Blowfish is a 4/8 byte block cipher
+	// so first check the length of the data
+	// if the data is no multiple of 4, exit with error
+	encrypt					:= data.diSize MOD 4;
+	IF encrypt = 0 	AND_THEN data.diSize > 0	THEN
+		nMultiples			:= data.diSize / 4;				// Number of blocks
+		bEvenMultiples		:= nMultiples MOD 2 = 0;		// Even number of blocks
+		FOR i := 0 TO nMultiples-1 BY 2 DO
+			dataL				:=
+			dataR				:= 16#0;
+			memcpy(ADR(dataL), ADR(data.pValue[i*4]), 4);
+			IF 	i <	nMultiples-1 OR_ELSE bEvenMultiples THEN
+				memcpy(ADR(dataR), ADR(data.pValue[(i+1)*4]), 4);
+				encipher(dataL, dataR);
+				memcpy(ADR(data.pValue[i*4]), ADR(dataL), 4);				
+				memcpy(ADR(data.pValue[(i+1)*4]), ADR(dataR), 4);
+			ELSE
+				encipher(dataL, dataR);
+				memcpy(ADR(data.pValue[i*4]), ADR(dataL), 4);				
+			END_IF	
+		END_FOR
+	ELSE
+		nErrorId			:= TO_UDINT(E_ERR_DataLength_NOK);
+		_error();		
+	END_IF  
+ELSE
+	initialize(SecretKey, SecretKeyBytes, bLittleEndian);
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="F" Id="{ba7e25a6-8d5c-4a62-86a7-9f7cc9f57427}">
+      <Declaration><![CDATA[METHOD PRIVATE F 			: UDINT
+VAR_INPUT
+	x						: UDINT;
+END_VAR
+VAR
+	a						: UDINT;
+	b						: UDINT;
+	c						: UDINT;
+	d						: UDINT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[d := x AND 16#00FF;
+x := SHR(x,8);			// x >>= 8 ==== x = x >> 8
+c := x AND 16#00FF;
+x := SHR(x,8);			
+b := x AND 16#00FF;
+x := SHR(x,8);			
+a := x AND 16#00FF;
+//y = ((_S[0][a] + _S[1][b]) ^ _S[2][c]) + _S[3][d];
+f := _S[0,a] + _S[1,b];
+f := f XOR _S[2,c];
+f := f + _S[3,d];]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="initialize" Id="{7d5dc061-f748-488c-b9d3-976ce3f750ac}">
+      <Declaration><![CDATA[METHOD PRIVATE initialize
+VAR_INPUT	
+	key						: POINTER TO BYTE;
+	keybytes				: INT;
+	bLittleEndian			: BOOL:=TRUE;	(* TRUE: Eg: Intel, FALSE: Eg: Motorola *)
+END_VAR
+VAR
+	// Locals
+	i						: INT;
+	j						: INT;
+	k						: INT;
+	data					: UDINT;
+	dataL					: UDINT;
+	dataR					: UDINT;		
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE eBF_State				OF
+
+	E_BF_Idle:		(* Idle state *)
+		_Busy();
+		hSubKeyFile			:= 0;
+		eBF_State 			:= E_BF_FileOpen;
+
+	E_BF_FileOpen:		(* Open source file *)
+         fbFileOpen(bExecute:=FALSE );
+         fbFileOpen( 
+			sPathName 		:= subKeyFilename,
+			nMode 			:= FOPEN_MODEREAD OR FOPEN_MODEBINARY,
+            ePath 			:= PATH_BOOTPATH, 
+			bExecute 		:= TRUE
+			);
+		eBF_State 			:= E_BF_FileOpening;
+
+	E_BF_FileOpening:		(* Open source file *)
+		fbFileOpen( bExecute := FALSE );
+		IF NOT fbFileOpen.bBusy 	THEN
+			IF fbFileOpen.bError 	THEN
+				nErrorId 	:= fbFileOpen.nErrId;
+				eBF_State	:= E_BF_Error;
+			ELSE
+				hSubKeyFile := fbFileOpen.hFile;
+				eBF_State	:= E_BF_FileIsOpened;
+			END_IF
+		END_IF
+
+	E_BF_FileIsOpened: 	(* Step without specific interaction *)
+		eBF_State			:= E_BF_P_Array_Read;
+
+	E_BF_P_Array_Read:
+		fbFileRead(bExecute	:= FALSE);	
+		fbFileRead(
+			hFile			:= hSubKeyFile, 
+			pReadBuff		:= ADR(_P), 
+			cbReadLen		:= SIZEOF(_P), 
+			bExecute		:= TRUE
+			);	
+		eBF_State 			:= E_BF_P_Array_IsRead;
+
+	E_BF_P_Array_IsRead:
+		fbFileRead(bExecute	:= FALSE);	
+		IF NOT fbFileRead.bBusy 	THEN
+			IF fbFileRead.bError 	THEN
+				nErrorId 	:= fbFileRead.nErrId;
+				eBF_State	:= E_BF_Error;
+			ELSE
+				IF bLittleEndian	THEN
+					FOR i := 0 TO N+1 DO
+						_P[i] := InverseEndian(_P[i]);
+					END_FOR
+				END_IF				      
+				eBF_State	:= E_BF_S_Boxes_Read;
+			END_IF
+		END_IF
+		
+	E_BF_S_Boxes_Read:
+		fbFileRead(bExecute	:= FALSE);	
+		fbFileRead(
+			hFile			:= hSubKeyFile, 
+			pReadBuff		:= ADR(_S), 
+			cbReadLen		:= SIZEOF(_S), 
+			bExecute		:= TRUE
+			);	
+		eBF_State 			:= E_BF_S_Boxes_IsRead;
+
+	E_BF_S_Boxes_IsRead:
+		fbFileRead(bExecute	:= FALSE);	
+		IF NOT fbFileRead.bBusy 	THEN
+			IF fbFileRead.bError 	THEN
+				nErrorId 	:= fbFileRead.nErrId;
+				eBF_State	:= E_BF_Error;
+			ELSE
+				IF bLittleEndian	THEN
+					FOR i := 0 TO 3 DO
+						FOR j := 0 TO 255 DO
+							_S[i,j] := InverseEndian(_S[i,j]);							
+						END_FOR						
+					END_FOR
+				END_IF				      
+				eBF_State	:= E_BF_Fileclose;
+			END_IF
+		END_IF
+
+	E_BF_Fileclose:     	(* Close the subkey file *)
+	 	fbFileClose( bExecute := FALSE );
+		fbFileClose( 
+			hFile			:= hSubKeyFile, 
+			bExecute		:= TRUE
+			);
+		eBF_State			:= E_BF_FileClosing;
+
+	E_BF_FileClosing:     (* Closing the subkey file *)
+		fbFileClose( bExecute := FALSE );
+		IF NOT fbFileClose.bBusy THEN
+			IF fbFileClose.bError THEN
+				nErrorId 	:= fbFileClose.nErrId;
+				eBF_State	:= E_BF_Error;
+			ELSE
+				hSubKeyFile := 0;
+				eBF_State	:= E_BF_FileIsClosed;
+			END_IF
+		END_IF
+
+	E_BF_FileIsClosed:     (* The subkey file is closed *)
+		// Hash the P array with the key
+      	j 					:= 0;
+      	FOR i := 0 TO N + 1 DO
+	 		data := 16#00000000;
+	 		FOR k := 0 TO 3 DO
+				// Includes the bugfix proposed here
+				// https://www.schneier.com/wp-content/uploads/2015/12/blowfish-bug-2.txt
+	    		data := SHL(data, 8) OR (key[j] AND 16#FF);
+	    		j := j + 1;
+	    		IF (j >= keybytes) THEN
+	       			j := 0;
+				END_IF
+			END_FOR
+			_P[i] := _P[i] XOR data;
+		END_FOR
+		dataL 	:= 16#00000000;
+      	dataR 	:= 16#00000000;	
+
+		// Encipher the P-array 
+      	FOR i := 0 TO N + 1 BY 2 DO
+	    	encipher(dataL, dataR);
+         	_P[i] := dataL;
+         	_P[i + 1] := dataR;
+      	END_FOR
+		
+		// Encipher the S-Boxes
+      	FOR i := 0 TO 3 DO
+         	FOR j := 0 TO 255 BY 2 DO
+	            encipher(dataL, dataR);
+            	_S[i,j] 	:= dataL;
+            	_S[i,j + 1]	:= dataR;
+			END_FOR
+		END_FOR		
+		eBF_State		:= E_BF_SelfTest_Encryption;
+
+	E_BF_Error: (* Error => Cleanup / retry opening *)
+		_error();
+		IF (hSubKeyFile <> 0 ) THEN (* Close the subkey file if open*)
+			eBF_State		:= E_BF_FileClose; 
+	 	ELSE
+			eBF_State		:= E_BF_FileOpen;      (* Error, retry open *)
+		END_IF
+
+	E_BF_SelfTest_Encryption:	(* Internal self test of the encryption algorithm *)
+		dataL				:= 16#1;
+		dataR				:= 16#2;	
+		encipher(dataL, dataR);
+		IF (dataL = 16#DF333FD2 AND dataR = 16#30A71BB4)	THEN
+			bSelfTestEncryptionOK 	:= TRUE;
+		END_IF
+		eBF_State			:= E_BF_SelfTest_Decryption;
+		 	
+	E_BF_SelfTest_Decryption:	(* Internal self test of the encryption algorithm *)
+		dataL				:= 16#DF333FD2;
+		dataR				:= 16#30A71BB4;	
+		decipher(dataL, dataR);
+		IF (dataL = 16#1 AND dataR = 16#2)	THEN
+			bSelfTestDecryptionOK 	:= TRUE;
+		END_IF
+		eBF_State			:= E_BF_Ready;
+		 	
+	E_BF_Ready:
+		IF bSelfTestEncryptionOK AND bSelfTestDecryptionOK		THEN
+			_done();
+		ELSE
+			nErrorId		:= TO_UDINT(E_ERR_SelfTest_Encryption);
+			_error();
+		END_IF
+	ELSE;
+		
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="inverseEndian" Id="{2de48b6b-c54a-4c69-89ac-091454ef6c40}">
+      <Declaration><![CDATA[METHOD PRIVATE inverseEndian : DWORD
+VAR_INPUT
+	data		: DWORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[(*
+ data = ((data & 0xFF000000) >> 24) |
+	((data & 0x00FF0000) >>  8) |
+	((data & 0x0000FF00) <<  8) |
+	((data & 0x000000FF) << 24);
+*)
+InverseEndian := 
+	SHR((data AND 16#FF000000), 24) OR
+	SHR((data AND 16#00FF0000), 8) OR
+	SHL((data AND 16#0000FF00), 8) OR
+	SHL((data AND 16#000000FF), 24);]]></ST>
+      </Implementation>
+    </Method>
+    <LineIds Name="FB_Blowfish">
+      <LineId Id="264" Count="0" />
+      <LineId Id="183" Count="0" />
+      <LineId Id="265" Count="0" />
+      <LineId Id="9" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish._busy">
+      <LineId Id="6" Count="3" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish._done">
+      <LineId Id="6" Count="3" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish._error">
+      <LineId Id="6" Count="1" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish.decipher">
+      <LineId Id="75" Count="7" />
+      <LineId Id="104" Count="0" />
+      <LineId Id="84" Count="3" />
+      <LineId Id="105" Count="0" />
+      <LineId Id="89" Count="1" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish.decrypt">
+      <LineId Id="95" Count="10" />
+      <LineId Id="135" Count="0" />
+      <LineId Id="107" Count="0" />
+      <LineId Id="137" Count="0" />
+      <LineId Id="125" Count="0" />
+      <LineId Id="127" Count="1" />
+      <LineId Id="109" Count="0" />
+      <LineId Id="126" Count="0" />
+      <LineId Id="129" Count="0" />
+      <LineId Id="113" Count="0" />
+      <LineId Id="117" Count="6" />
+      <LineId Id="8" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish.encipher">
+      <LineId Id="51" Count="2" />
+      <LineId Id="69" Count="0" />
+      <LineId Id="55" Count="4" />
+      <LineId Id="68" Count="0" />
+      <LineId Id="60" Count="5" />
+      <LineId Id="35" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish.encrypt">
+      <LineId Id="95" Count="13" />
+      <LineId Id="125" Count="0" />
+      <LineId Id="127" Count="1" />
+      <LineId Id="109" Count="0" />
+      <LineId Id="126" Count="0" />
+      <LineId Id="129" Count="0" />
+      <LineId Id="113" Count="0" />
+      <LineId Id="117" Count="6" />
+      <LineId Id="8" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish.F">
+      <LineId Id="40" Count="2" />
+      <LineId Id="52" Count="0" />
+      <LineId Id="44" Count="0" />
+      <LineId Id="53" Count="0" />
+      <LineId Id="46" Count="4" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish.initialize">
+      <LineId Id="231" Count="0" />
+      <LineId Id="239" Count="0" />
+      <LineId Id="513" Count="26" />
+      <LineId Id="235" Count="0" />
+      <LineId Id="583" Count="0" />
+      <LineId Id="255" Count="0" />
+      <LineId Id="238" Count="0" />
+      <LineId Id="284" Count="0" />
+      <LineId Id="277" Count="0" />
+      <LineId Id="279" Count="2" />
+      <LineId Id="256" Count="0" />
+      <LineId Id="282" Count="0" />
+      <LineId Id="285" Count="1" />
+      <LineId Id="253" Count="0" />
+      <LineId Id="289" Count="3" />
+      <LineId Id="294" Count="1" />
+      <LineId Id="337" Count="1" />
+      <LineId Id="345" Count="0" />
+      <LineId Id="342" Count="1" />
+      <LineId Id="297" Count="2" />
+      <LineId Id="287" Count="0" />
+      <LineId Id="300" Count="14" />
+      <LineId Id="316" Count="1" />
+      <LineId Id="326" Count="0" />
+      <LineId Id="331" Count="0" />
+      <LineId Id="334" Count="0" />
+      <LineId Id="346" Count="0" />
+      <LineId Id="336" Count="0" />
+      <LineId Id="333" Count="0" />
+      <LineId Id="328" Count="0" />
+      <LineId Id="344" Count="0" />
+      <LineId Id="347" Count="1" />
+      <LineId Id="321" Count="0" />
+      <LineId Id="363" Count="12" />
+      <LineId Id="393" Count="0" />
+      <LineId Id="377" Count="2" />
+      <LineId Id="394" Count="0" />
+      <LineId Id="380" Count="0" />
+      <LineId Id="390" Count="1" />
+      <LineId Id="609" Count="0" />
+      <LineId Id="398" Count="3" />
+      <LineId Id="678" Count="1" />
+      <LineId Id="402" Count="3" />
+      <LineId Id="413" Count="1" />
+      <LineId Id="416" Count="0" />
+      <LineId Id="415" Count="0" />
+      <LineId Id="411" Count="1" />
+      <LineId Id="610" Count="0" />
+      <LineId Id="459" Count="0" />
+      <LineId Id="461" Count="0" />
+      <LineId Id="463" Count="0" />
+      <LineId Id="465" Count="2" />
+      <LineId Id="417" Count="0" />
+      <LineId Id="611" Count="0" />
+      <LineId Id="468" Count="0" />
+      <LineId Id="470" Count="0" />
+      <LineId Id="472" Count="0" />
+      <LineId Id="475" Count="2" />
+      <LineId Id="460" Count="0" />
+      <LineId Id="483" Count="0" />
+      <LineId Id="482" Count="0" />
+      <LineId Id="573" Count="6" />
+      <LineId Id="618" Count="0" />
+      <LineId Id="630" Count="9" />
+      <LineId Id="663" Count="1" />
+      <LineId Id="642" Count="5" />
+      <LineId Id="480" Count="0" />
+      <LineId Id="620" Count="0" />
+      <LineId Id="648" Count="0" />
+      <LineId Id="650" Count="2" />
+      <LineId Id="649" Count="0" />
+      <LineId Id="621" Count="0" />
+      <LineId Id="481" Count="0" />
+      <LineId Id="236" Count="0" />
+      <LineId Id="257" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_Blowfish.inverseEndian">
+      <LineId Id="9" Count="9" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

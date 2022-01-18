@@ -1,0 +1,99 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.9">
+  <POU Name="P_Blowfish" Id="{0159082d-a996-462b-8c69-b8a97037d54d}" SpecialFunc="None">
+    <Declaration><![CDATA[(* 
+	Encrypting data with the Blowfish algorithm
+	More info: https://www.schneier.com/academic/blowfish/
+
+	original code 
+	C by Bruce Schneier	https://www.schneier.com/wp-content/uploads/2015/12/bfsh-sch.zip
+
+	TwinCAT code released under MIT license (https://opensource.org/licenses/MIT)
+	Kim Robbens (2022) 	
+	
+	USAGE:
+		* The subkeyfile BLOWFISH.DAT should be placed in the TwinCAT default boot folder. 
+		  In most cases this is C:\TwinCAT\3.1\Boot.
+		* define instance of FB_BlowFish
+		* define a secret key, can be any data type, the max length is 56 bytes / 448 bits
+		  as defined in the Blowfish specification
+		* initialize the FB_Blowfish instance with the necessary parameters  
+			- secret key
+			- length of the secret key
+			- endianness of the system, TRUE: Eg: Intel, FALSE: Eg: Motorola 
+*)
+PROGRAM P_Blowfish
+VAR
+	// Blowfish algorithm
+	fbBlowFish			: FB_BlowFish;
+	
+	// Test secret key
+	key 				: T_MAXSTRING := 'TESTKEY';
+	
+	
+	
+	(********************  UNIT TESTS  ***********************)
+	// Test string to encrypt, its length should be a multiple of 4 bytes
+	// real size of a string is [15] + NULL character == 16 !!
+	sString				: STRING[15] := 'ABCDEFGHIJKLMNO';	
+	nStringLengthOK		: DINT;
+	// If the length is nok, an error will be returned with the # of exceeding bytes 
+	sStringNOK			: STRING[17] := 'ABCD_EFGH_IJKL_MN';
+	nStringLengthNOK	: DINT;
+
+	// Test array to encrypt
+	byBytes				: ARRAY[0..7] OF BYTE := [16#11,16#12,16#13,16#14,16#15,16#16,16#0,16#0];
+	nArrayLengthOK		: DINT;
+	
+	// Test lreal
+	lr					: LREAL := 123.2231; // be aware of binary notation rounding!
+	nlr					: DINT;
+
+	// test lint
+	li					: LINT := -12123123412345;
+	nli					: DINT;	
+	(********************  UNIT TESTS  ***********************)
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// Make sure the subkey file blowfish.dat is located in the TwinCAT 3 root boot folder
+// eg. C:\TwinCAT\3.1\Boot
+
+// Blowfish implementation test
+IF fbBlowFish.bInitialized		THEN
+	(********************  UNIT TESTS  ***********************)
+	// Any datatype can be used to encrypt, 
+	// as long as it real length MOD 8 == 0
+	// examples below 
+	nStringLengthOK 	:= fbBlowFish.encrypt(sString);		// string length is ok
+	nStringLengthOK 	:= fbBlowFish.decrypt(sString);
+	nStringLengthNOK 	:= fbBlowFish.encrypt(sStringNOK);	// returns the # of extra characters
+	nStringLengthNOK 	:= fbBlowFish.decrypt(sStringNOK);
+	nArrayLengthOK 		:= fbBlowFish.encrypt(byBytes);		// test bytes array
+	nArrayLengthOK 		:= fbBlowFish.decrypt(byBytes);
+	nlr 				:= fbBlowFish.encrypt(lr);			// test lreal
+	nlr 				:= fbBlowFish.decrypt(lr);
+	nli 				:= fbBlowFish.encrypt(li);			// test lint
+	nli 				:= fbBlowFish.decrypt(li);	
+	(********************  UNIT TESTS  ***********************)
+ELSE	// Initializing
+	fbBlowFish(SecretKey:=ADR(key), SecretKeyBytes:=len(key), bLittleEndian:=TRUE);	
+END_IF]]></ST>
+    </Implementation>
+    <LineIds Name="P_Blowfish">
+      <LineId Id="299" Count="0" />
+      <LineId Id="301" Count="0" />
+      <LineId Id="300" Count="0" />
+      <LineId Id="152" Count="0" />
+      <LineId Id="154" Count="0" />
+      <LineId Id="371" Count="0" />
+      <LineId Id="271" Count="2" />
+      <LineId Id="265" Count="3" />
+      <LineId Id="290" Count="1" />
+      <LineId Id="294" Count="1" />
+      <LineId Id="297" Count="1" />
+      <LineId Id="372" Count="0" />
+      <LineId Id="165" Count="2" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
